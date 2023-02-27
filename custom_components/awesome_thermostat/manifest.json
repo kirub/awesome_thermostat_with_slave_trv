@@ -1,15 +1,16 @@
 {
-  "domain": "awesome_thermostat",
-  "name": "Awesome Thermostat",
-  "documentation": "https://github.com/dadge/awesome_thermostat",
+  "domain": "kirub_awesome_thermostat",
+  "name": "@kirub Awesome Thermostat",
+  "documentation": "https://github.com/kirub/awesome_thermostat_with_slave_trv",
   "dependencies": [
     "sensor",
-    "switch"
+    "switch",
+    "climate"
   ],
   "codeowners": [
-    "@dadge"
+    "@kirub"
   ],
   "version": "1.0.0",
-  "issue_tracker": "https://github.com/dadge/awesome_thermostat/issues",
+  "issue_tracker": "https://github.com/kirub/awesome_thermostat/issues",
   "iot_class": "local_polling"
 }
