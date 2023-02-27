@@ -44,7 +44,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import DOMAIN as HA_DOMAIN, CoreState, callback
 from homeassistant.exceptions import ConditionError
-from homeassistant.helpers import condition
+from homeassistant.helpers import condition, entity_registry as er
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import (
     async_track_state_change_event,
@@ -65,6 +65,7 @@ DEFAULT_NAME = "Awesome Thermostat"
 CONF_HEATER = "heater"
 CONF_SENSOR = "target_sensor"
 CONF_WINDOWS_SENSOR = "window_sensor"
+CONF_CLIMATES = "slave_climates"
 CONF_MOTION_SENSOR = "motion_sensor"
 CONF_MOTION_MODE = "motion_mode"
 CONF_NO_MOTION_MODE = "no_motion_mode"
@@ -100,6 +101,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_HEATER): cv.entity_id,
         vol.Required(CONF_SENSOR): cv.entity_id,
         vol.Optional(CONF_WINDOWS_SENSOR): cv.entity_id,
+        vol.Optional(CONF_CLIMATES): cv.entity_ids,
         vol.Optional(CONF_MOTION_SENSOR): cv.entity_id,
         vol.Optional(CONF_MOTION_MODE): cv.string,
         vol.Optional(CONF_NO_MOTION_MODE): cv.string,
@@ -133,6 +135,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     heater_entity_id = config.get(CONF_HEATER)
     temperature_entity_id = config.get(CONF_SENSOR)
     windows_entity_id = config.get(CONF_WINDOWS_SENSOR)
+    slave_climate_entities_id = config.get(CONF_CLIMATES)
     min_temp = config.get(CONF_MIN_TEMP)
     max_temp = config.get(CONF_MAX_TEMP)
     target_temp = config.get(CONF_TARGET_TEMP)
@@ -161,6 +164,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
                 heater_entity_id,
                 temperature_entity_id,
                 windows_entity_id,
+                slave_climate_entities_id,
                 motion_entity_id,
                 motion_mode,
                 no_motion_mode,
@@ -192,6 +196,7 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         heater_entity_id,
         temperature_entity_id,
         windows_entity_id,
+        slave_climate_entities_id,
         motion_entity_id,
         motion_mode,
         no_motion_mode,
@@ -215,6 +220,14 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         self.heater_entity_id = heater_entity_id
         self.temperature_entity_id = temperature_entity_id
         self.windows_entity_id = windows_entity_id
+
+        entity_reg = er.async_get_registry(self.hass)
+        self.slave_climate_entities_id = slave_climate_entities_id
+        self.slave_climates = []
+        for climate_entity_id in self.slave_climate_entities_id:
+            climate_object = entity_reg.async_get(climate_entity_id)
+            self.slave_climates.append(climate_object)
+
         self.motion_entity_id = motion_entity_id
         self.motion_mode = motion_mode
         self.no_motion_mode = no_motion_mode
@@ -285,6 +298,14 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         self.async_on_remove(
             async_track_state_change_event(
                 self.hass, [self.heater_entity_id], self._async_switch_changed
+            )
+        )
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [self.slave_climate_entities_id],
+                self._async_slave_climates_changed,
             )
         )
 
@@ -422,6 +443,10 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         """List of available operation modes."""
         return self._hvac_list
 
+    def get_slave_climate(self, idx):
+        """returns climate entity at idx index."""
+        return self.slave_climates[idx]
+
     async def async_set_hvac_mode(self, hvac_mode):
         """Set hvac mode."""
         if hvac_mode == HVAC_MODE_HEAT:
@@ -437,6 +462,11 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         else:
             _LOGGER.error("Unrecognized hvac mode: %s", hvac_mode)
             return
+
+        for climate in self.slave_climates:
+            if climate._hvac_mode != self._hvac_mode:
+                climate.async_set_hvac_mode(self._hvac_mode)
+
         # Ensure we update the current operation after changing the mode
         self.async_write_ha_state()
 
@@ -448,6 +478,10 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         self._target_temp = temperature
         self._attr_preset_mode = PRESET_NONE
         await self._async_control_heating(force=True)
+
+        for climate in self.slave_climates:
+            climate.async_set_temperature(kwargs)
+
         self.async_write_ha_state()
 
     @property
@@ -547,6 +581,14 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
         if old_state is None:
             self.hass.create_task(self._check_switch_initial_state())
         self.async_write_ha_state()
+
+    @callback
+    def _async_slave_climates_changed(self, event):
+        """Handle climates state changes."""
+        new_state = event.data.get("new_state")
+
+        if new_state != self._hvac_mode:
+            self.async_set_hvac_mode(new_state)
 
     @callback
     def _async_update_temp(self, state):
@@ -656,22 +698,28 @@ class AwesomeThermostat(ClimateEntity, RestoreEntity):
             raise ValueError(
                 f"Got unsupported preset_mode {preset_mode}. Must be one of {self._attr_preset_modes}"
             )
-        if preset_mode == self._attr_preset_mode:
-            # I don't think we need to call async_write_ha_state if we didn't change the state
-            return
-        if preset_mode == PRESET_NONE:
-            self._attr_preset_mode = PRESET_NONE
-            self._target_temp = self._saved_target_temp
-            await self._async_control_heating(force=True)
-        elif preset_mode == PRESET_ACTIVITY:
-            self._attr_preset_mode = PRESET_ACTIVITY
-            self._target_temp = self._presets[self.no_motion_mode]
-            await self._async_control_heating(force=True)
-        else:
-            if self._attr_preset_mode == PRESET_NONE:
-                self._saved_target_temp = self._target_temp
-            self._attr_preset_mode = preset_mode
-            self._target_temp = self._presets[preset_mode]
-            await self._async_control_heating(force=True)
 
-        self.async_write_ha_state()
+        # I don't think we need to call async_write_ha_state if we didn't change the state
+        state_changed = preset_mode != self._attr_preset_mode
+        if state_changed:
+            if preset_mode == PRESET_NONE:
+                self._attr_preset_mode = PRESET_NONE
+                self._target_temp = self._saved_target_temp
+                await self._async_control_heating(force=True)
+            elif preset_mode == PRESET_ACTIVITY:
+                self._attr_preset_mode = PRESET_ACTIVITY
+                self._target_temp = self._presets[self.no_motion_mode]
+                await self._async_control_heating(force=True)
+            else:
+                if self._attr_preset_mode == PRESET_NONE:
+                    self._saved_target_temp = self._target_temp
+                self._attr_preset_mode = preset_mode
+                self._target_temp = self._presets[preset_mode]
+                await self._async_control_heating(force=True)
+
+        for climate in self.slave_climates:
+            if climate.preset_mode != self._attr_preset_mode:
+                climate.async_set_temperature(self._target_temp)
+
+        if state_changed:
+            self.async_write_ha_state()
